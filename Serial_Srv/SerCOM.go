@@ -1,8 +1,7 @@
 package Serial_Srv
 
 import (
-	"RMS_Node/Common"
-	"RMS_Node/util"
+	"FW_OCD/util"
 	"RMS_Srv/Protocol"
 	"RMS_Srv/Public"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tarm/serial"
 	"os"
+	"syscall"
 	"time"
 )
 
@@ -31,11 +31,13 @@ type Call struct {
 	To      *time.Timer
 	Request interface{}
 	Reply   interface{}
+	Flag    uint
 	Done    chan *Call //用于结果返回时,消息通知,使用者必须依靠这个来获取真正的结果。
 }
 
 func (call *Call) TO() {
 	fmt.Println("ooops")
+	call.Flag = 48
 	call.Reply = []byte("com time out")
 	call.done()
 }
@@ -66,10 +68,11 @@ func SerialPortDaemon() {
 	var c serial.Config
 
 	portlist, err := GetPortsList()
-	if err != nil{
+	if err != nil {
+
 		log.Panic("no port founded ", err)
 	}
-	fmt.Println(portlist, err)
+	fmt.Println("found ports", portlist)
 
 	c.Baud = 115200
 	c.Size = 8
@@ -79,75 +82,66 @@ func SerialPortDaemon() {
 	//port, _ = serial.OpenPort(&c)
 
 	ComTrans_Ch = make(chan []byte, 1)
+out_search_dev:
 	for _, portx := range portlist {
 		c.Name = portx
+		fmt.Println("try search device on port ", c.Name)
 		port, err = serial.OpenPort(&c)
 		if err != nil {
-			log.Panic("open port ", err)
+			log.Debug("open port ", err)
+			c.Name = ""
+			continue
 		}
 		defer port.Close()
+		port.Flush()
 
 		affair[1] = new(Call)
 		affair[1].Id = 1
 		affair[1].Done = make(chan *Call, 1)
 		affair[1].Request = SUB_PROC_VER
-		affair[1].To = time.AfterFunc(5e9, affair[1].TO)
+		affair[1].To = time.AfterFunc(1e9, affair[1].TO)
 
-		fmt.Println(portx)
 		go EchoWaiter(*port)
+
 		echo(*port)
 		//read uid
 
-		c := <-affair[1].Done
-		fmt.Println("reply", c.Reply)
-		if c.Reply != nil {
+		ret := <-affair[1].Done
+		//fmt.Println("reply", ret.Reply)
+		switch ret.Flag {
+
+		case 10:
 			var cc Public.TcpTrucker
 			cc.Cmd = Protocol.Fc_HB
-			cc.Dat = c.Reply
+			cc.Dat = ret.Reply
 			cc.Ip = Public.LocalNode.NodeIPP
 			Public.TcpSender_Ch <- cc
-			c.Del()
-			break
-		} else {
-			c.Del()
+			ret.Del()
+			break out_search_dev
+		default:
+			c.Name = ""
+			ret.Del()
+
 		}
 
 	}
 
-	affair[1] = new(Call)
-	affair[1].Id = 1
-	affair[1].Done = make(chan *Call, 1)
-	affair[1].Request = SUB_PROC_VER
-	affair[1].To = time.AfterFunc(5e9, affair[1].TO)
-	SendCMD(*port, []byte{0xF0, 0x83}, []byte{0x00, 0x50, 0x00, 0x06})
-	rec := <-affair[1].Done
-	if rec.Reply != nil {
-		fmt.Println("reply", rec.Reply)
-		var cc Public.TcpTrucker
-		cc.Cmd = Protocol.Fc_HC
-		cc.Dat = rec.Reply.([]byte)
-		cc.Ip = Public.LocalNode.NodeIPP
-
-		copy(Public.LocalNode.McuId ,rec.Reply.([]byte) )
-
-		Public.TcpSender_Ch <- cc
-		rec.Del()
+	if c.Name != "" {
+		fmt.Println("found dev,start download with port ", c.Name)
+		input := "iRobot1_HGD.bin"
+		Sendfile(input)
+	} else {
+		fmt.Println("can't find device or port,exit ")
 
 	}
 
-	//go EchoWaiter(*port)
-	Deamon_Standby := make(chan bool)
-	<- Deamon_Standby
 }
-
-
 
 func EchoWaiter(port serial.Port) { // Read and print the response
 
 	buff := make([]byte, 4096)
 	var res []byte
 	var cnt int = 0
-	var mark bool = true
 
 	//Out:
 	for true {
@@ -156,7 +150,10 @@ func EchoWaiter(port serial.Port) { // Read and print the response
 			n, err := port.Read(buff)
 
 			if err != nil {
-				log.Fatal(err)
+				if err == error(syscall.ERROR_OPERATION_ABORTED) {
+					return
+				}
+				log.Debug(err)
 				break
 			}
 			if n == 0 {
@@ -171,39 +168,16 @@ func EchoWaiter(port serial.Port) { // Read and print the response
 			//}
 			//fmt.Printf("\r\nrec %d     \r\n", cnt, res)
 			res = append(res, buff[:n]...)
-			if Common.SpecialComStat {
 
-				res = res[len(res):]
-				switch Common.SpecialComTast {
-				case Common.File_Trans:
-					if mark {
-						Common.Ch_Ft_start <- 1
-						mark = false
-					}
-
-					fmt.Printf("File_Trans %s", buff[:n])
-
-					fmt.Println("File_Trans", buff[:n])
-					if buff[0] == 6 {
-						fmt.Println("ack")
-						fmt.Println(Common.Ch_ComStreamData)
-					}
-					Common.Ch_ComStreamData <- buff[:n]
-
-				default:
-					break
-
-				}
-
-			} else if len(res) > 7 {
+			if len(res) > 7 {
 				err := CheckFrame(res)
 				if err.Error() == "0" {
 
 					switch res[5] {
 					case MAIN_RMS:
 						ctr++
-						fmt.Println("\ngot pack", ctr, res)
-						fmt.Printf("\ngot pack %d, %s \n", ctr, res[:int(9+res[4])])
+						//fmt.Println("\ngot pack", ctr, res)
+						//fmt.Printf("\ngot pack %d, %s \n", ctr, res[:int(9+res[4])])
 						ComTrans_Ch <- res[:int(9+res[4])]
 						res = res[int(9+res[4]):]
 					case MAIN_STRING:
@@ -217,8 +191,10 @@ func EchoWaiter(port serial.Port) { // Read and print the response
 							switch v.Request {
 							case SUB_PROC_VER:
 								v.Reply = res[7:int(7+res[4])]
+								v.Flag = 10
 								v.done()
 							case SUB_PROC_UID:
+								v.Flag = 16
 								v.Reply = res[7:int(7+res[4])]
 								v.done()
 							default:
@@ -237,8 +213,8 @@ func EchoWaiter(port serial.Port) { // Read and print the response
 					switch res[5] {
 					case MAIN_RMS:
 						ctr++
-						fmt.Println("\ngot pack", ctr, res)
-						fmt.Printf("\ngot pack %d, %s \n", ctr, res[:int(9+res[4])])
+						//fmt.Println("\ngot pack", ctr, res)
+						//fmt.Printf("\ngot pack %d, %s \n", ctr, res[:int(9+res[4])])
 						ComTrans_Ch <- res[:int(9+res[4])]
 					case MAIN_STRING:
 						fmt.Printf("\ngot msg %s \n", res[:int(9+res[4])])
@@ -254,8 +230,8 @@ func EchoWaiter(port serial.Port) { // Read and print the response
 					res = res[:0]
 				} else {
 					res = res[:0]
-					fmt.Println(err)
-					panic(err)
+					//fmt.Println(err)
+					//log.Debug(err)
 				}
 
 			}
@@ -275,10 +251,9 @@ func CheckFrame(res []byte) error {
 
 		return errors.New("2")
 	}
-
-	fmt.Printf("\nwrong pack %s", res)
-	fmt.Printf("\nwrong pack % X\n\n", res)
-	return errors.New("wrong Frame~!")
+	//fmt.Printf("\nwrong pack %s", res)
+	fmt.Printf("\nwrong pack %s % X\n\n", res, res)
+	return errors.New("5")
 }
 
 //send a echo ,return with send err
@@ -325,13 +300,13 @@ func SendCMD(port serial.Port, cmd []byte, dat []byte) {
 	send[7+dl] = byte((ret >> 8) & 0xff)
 	send[8+dl] = byte(ret & 0xff)
 
-	n, err := port.Write(send[:9+dl])
+	_, err := port.Write(send[:9+dl])
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	//fmt.Printf("\n\n [%s] send cmd, % d bytes:% X \n",time.Now().UnixNano(), n, send[:9+dl])
-	fmt.Printf("\n\n [%s] send cmd, % d  \n", time.Now().UnixNano(), n)
+	//fmt.Printf("\n\n [%s] send cmd, % d  \n", time.Now().UnixNano(), n)
 
 }
 
@@ -382,7 +357,7 @@ func Sendfile(input string) {
 	defer fi.Close()
 	fiinfo, err := fi.Stat()
 	s := fiinfo.Size()
-	fmt.Printf("\n %s the size of file is %d ", fiinfo.Name(), fiinfo.Size()) //fiinfo.Size() return int64 type
+	fmt.Printf("\nsize of file is %d \n", s) //fiinfo.Size() return int64 type
 
 	//send file head ,max file len 4GB(0xFFFFFFFF)
 	dat[0] = byte(s >> 24)
@@ -401,7 +376,7 @@ func Sendfile(input string) {
 
 	timecost := time.Now()
 
-	fmt.Printf("\n [%s]file str \n", timecost.Format(time.RFC3339Nano))
+	//	fmt.Printf("\n [%s]file str \n", timecost.Format(time.RFC3339Nano))
 
 	//file body
 	for {
@@ -415,11 +390,14 @@ func Sendfile(input string) {
 		ss, err = fi.ReadAt(dat[4:256+4], offsert*256)
 		if ss == 0 { // end of file
 			SendCMD(*port, []byte{MAIN_RMS, SUB_RMS_FILE_END}, dat[:0])
-			fmt.Printf("\n [%s]file end [%s] \n", time.Now().Format(time.RFC3339Nano), time.Now().Sub(timecost))
+			//fmt.Printf("\n [%s]file end [%s] \n", time.Now().Format(time.RFC3339Nano), time.Now().Sub(timecost))
 
 			break
 		}
-
+		i := 100 * int64(offsert) / (s / 256)
+		if offsert%10 == 0 || i == 100 {
+			fmt.Printf("\rprocess  %d%%", i)
+		}
 		SendCMD(*port, []byte{MAIN_RMS, SUB_RMS_FILEDATA}, dat[:4+ss])
 		c = <-ComTrans_Ch
 		if c[6] != SUB_RMS_FILEDATA || c[7+3] != dat[3] {
@@ -429,10 +407,6 @@ func Sendfile(input string) {
 		offsert++
 	}
 
-	c = <-ComTrans_Ch
-	if c[6] != SUB_RMS_FILE_END || c[7+3] != dat[3] {
-		fmt.Println("send hf complete", c)
-	}
-	//inform server task completed
+	fmt.Printf("\nFile send complete ,time cost %q \n", time.Now().Sub(timecost))
 
 }

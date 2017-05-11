@@ -112,7 +112,6 @@ func SerialPortDaemon() {
 			c.Del()
 		}
 
-
 	}
 
 	affair[1] = new(Call)
